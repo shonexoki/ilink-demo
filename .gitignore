@@ -1,0 +1,22 @@
+# venv
+venv/
+.venv/
+
+# python
+__pycache__/
+*.pyc
+
+# vscode
+.vscode/
+
+# env
+.env
+
+# mac
+.DS_Store
+
+# logs
+*.log
+
+# credentials
+data/credentials.json
