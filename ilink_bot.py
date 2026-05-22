@@ -265,48 +265,48 @@ class ILinkBot:
             "rawfilemd5": raw_md5,
             "filesize": enc_size,
             "aeskey": aes_key_hex,  # 使用 Hex 字符串
-            "no_need_thumb": False
+            "no_need_thumb": True  # 默认不生成缩略图，后续根据需要再上传
         }
 
-        thumb_enc_data = None
-        thumb_upload_param = None
+        # thumb_enc_data = None
+        # thumb_upload_param = None
 
         # 图片缩略图处理
-        if media_type == 1:
-            try:
-                with Image.open(file_path) as img:
-                    if img.width > 300 or img.height > 300:
-                        img.thumbnail((320, 320), Image.Resampling.LANCZOS)
-                        thumb_buffer = BytesIO()
-                        img.convert("RGB").save(thumb_buffer, format="JPEG", quality=85, optimize=True)
-                        thumb_raw = thumb_buffer.getvalue()
+        # if media_type == 1:
+        #     try:
+        #         with Image.open(file_path) as img:
+        #             if img.width > 300 or img.height > 300:
+        #                 img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+        #                 thumb_buffer = BytesIO()
+        #                 img.convert("RGB").save(thumb_buffer, format="JPEG", quality=85, optimize=True)
+        #                 thumb_raw = thumb_buffer.getvalue()
 
-                        thumb_raw_size = len(thumb_raw)
-                        thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
+        #                 thumb_raw_size = len(thumb_raw)
+        #                 thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
                         
-                        thumb_aes_key_bytes = os.urandom(16)
-                        thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
+        #                 thumb_aes_key_bytes = os.urandom(16)
+        #                 thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
 
-                        payload.update({
-                            "thumb_rawsize": thumb_raw_size,
-                            "thumb_rawfilemd5": thumb_raw_md5,
-                            "thumb_filesize": len(thumb_enc_data),
-                        })
-                        print("✅ 缩略图生成成功")
-                    else:
-                        payload["no_need_thumb"] = True
-            except Exception as e:
-                print(f"⚠️ 缩略图生成失败: {e}")
-                payload["no_need_thumb"] = True
+        #                 payload.update({
+        #                     "thumb_rawsize": thumb_raw_size,
+        #                     "thumb_rawfilemd5": thumb_raw_md5,
+        #                     "thumb_filesize": len(thumb_enc_data),
+        #                 })
+        #                 print("✅ 缩略图生成成功")
+        #             else:
+        #                 payload["no_need_thumb"] = True
+        #     except Exception as e:
+        #         print(f"⚠️ 缩略图生成失败: {e}")
+        #         payload["no_need_thumb"] = True
 
         # 调用 getuploadurl
         resp = await self._post("/ilink/bot/getuploadurl", payload)
         
         upload_param = resp.get("upload_param")
-        thumb_upload_param = resp.get("thumb_upload_param")
+        # thumb_upload_param = resp.get("thumb_upload_param")
         upload_full_url = resp.get("upload_full_url")
 
-        print(f"getuploadurl 返回 → upload_param: {bool(upload_param)}, thumb_upload_param: {bool(thumb_upload_param)}")
+        # print(f"getuploadurl 返回 → upload_param: {bool(upload_param)}, thumb_upload_param: {bool(thumb_upload_param)}")
 
         if not upload_param and not upload_full_url:
             raise Exception(f"getuploadurl 未返回 upload_param 或 upload_full_url: {resp}")
@@ -321,14 +321,14 @@ class ILinkBot:
         )
 
         # 上传缩略图（如果有）
-        if thumb_enc_data and thumb_upload_param:
-            await self._cdn_upload(
-                filekey=filekey,
-                encrypted_data=thumb_enc_data,
-                upload_param=thumb_upload_param,
-                upload_full_url=None,
-                label="缩略图"
-            )
+        # if thumb_enc_data and thumb_upload_param:
+        #     await self._cdn_upload(
+        #         filekey=filekey,
+        #         encrypted_data=thumb_enc_data,
+        #         upload_param=thumb_upload_param,
+        #         upload_full_url=None,
+        #         label="缩略图"
+        #     )
 
         # 构造 media_item
         media_item = {
@@ -439,17 +439,18 @@ class ILinkBot:
             
             # 将原 Hex 格式的 aes_key 转换为服务端要求的 Base64
             aes_key_hex = image_item["media"].get("aes_key", "")
-            if isinstance(aes_key_hex, str) and len(aes_key_hex) == 32:
+            aes_key_b64_node_style = base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8")
+            # if isinstance(aes_key_hex, str) and len(aes_key_hex) == 32:
                 # 标准用法：将 16 进制 bytes 编码为 Base64
-                aes_key_b64 = base64.b64encode(bytes.fromhex(aes_key_hex)).decode("utf-8")
+                # aes_key_b64 = base64.b64encode(bytes.fromhex(aes_key_hex)).decode("utf-8")
                 
                 # 【重要备选说明】: 
                 # 如果上面那行发送后依然报 aes_key 解密失败，请换成下面这行：
                 # aes_key_b64 = base64.b64encode(aes_key_hex.encode('utf-8')).decode("utf-8")
                 # 因为原 TS 中 `Buffer.from` 如果没加 'hex' 参数，默认是将字符串本身做 Base64 编码。
                 
-                image_item["media"]["aes_key"] = aes_key_b64
-
+                # image_item["media"]["aes_key"] = aes_key_b64
+        image_item["media"]["aes_key"] = aes_key_b64_node_style
         # 3. 构造 items 队列
         items = []
         if caption:
@@ -460,6 +461,8 @@ class ILinkBot:
         # 4. 修复1: 严格对齐 TS 中的 for 循环，每次只发送一个 item
         for item in items:
             payload = self._build_message_payload(to_user_id, [item], context_token)
+            payload.update({"message_type": 2})  
+            payload.update({"message_state": 2})
             await self._post("/ilink/bot/sendmessage", payload)
             
         print(f"📸 消息（文字/图片）已发送 → {to_user_id}")
@@ -540,6 +543,7 @@ class ILinkBot:
         
         text = ""
         image_path = None
+        file_path = None
         
         for item in msg.get("item_list", []):
             item_type = item.get("type")
@@ -551,6 +555,10 @@ class ILinkBot:
                 print(f"收到图片消息")
                 image_path = await self.download_image(item.get("image_item", {}), msg_id)
 
+            elif item_type == 4: # 文件 
+                file_path = await self.download_file(item.get("file_item", {}), msg_id)
+                print(f"收到文件消息，已保存到: {file_path}")
+
         if text:
             print(f"收到文本: {text}")
             await self.send_text(from_id, f"已收到：{text}", context_token)
@@ -559,6 +567,10 @@ class ILinkBot:
             # await self.send_text(from_id, f"已收到图片:{image_path}", context_token)
             # 示例：echo 发送回去
             await self.send_image(from_id, image_path, "这是你发给我的图片", context_token)
+
+        if file_path:            
+            # 示例：echo 发送回去
+            await self.send_file(from_id, file_path, "这是你发给我的文件", context_token)
 
     async def send_text(self, to_user_id: str, text: str, context_token: str):
         client_id = f"pybot-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
