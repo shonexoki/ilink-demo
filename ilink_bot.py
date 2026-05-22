@@ -5,6 +5,7 @@ import uuid
 import base64
 import hashlib
 import os
+from io import BytesIO
 import httpx
 from typing import Dict, Optional, Tuple
 import qrcode
@@ -216,15 +217,29 @@ class ILinkBot:
     def _generate_aes_key(self) -> Tuple[bytes, str]:
         """生成随机AES Key，返回 (bytes, base64格式)"""
         key_bytes = os.urandom(16)
-        # 协议常用：先转 hex 字符串，再 base64（最兼容）
-        key_hex = key_bytes.hex()
-        key_b64 = base64.b64encode(key_hex.encode()).decode()
+        key_b64 = base64.b64encode(key_bytes).decode()
         return key_bytes, key_b64
+
+    def _build_image_thumbnail(self, file_path: str) -> bytes:
+        """生成 JPEG 缩略图字节。"""
+        with Image.open(file_path) as img:
+            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG", quality=85, optimize=True)
+            return buffer.getvalue()
 
     # ====================== 新增：上传媒体 ======================
     async def upload_media(self, file_path: str, media_type: int = 1, to_user_id: str = "") -> Dict:
+        """加密并上传媒体，返回可放入 MessageItem 的媒体字段内容。"""
         if not os.path.exists(file_path):
             raise FileNotFoundError(file_path)
+        if media_type not in (1, 2, 3):
+            raise ValueError("media_type 仅支持 1=IMAGE, 2=VIDEO, 3=FILE")
+        if not to_user_id:
+            raise ValueError("上传媒体必须提供 to_user_id")
 
         with open(file_path, "rb") as f:
             raw_data = f.read()
@@ -247,25 +262,22 @@ class ILinkBot:
             "filesize": enc_size,
         }
 
-        # 图片处理缩略图
+        # 图片和视频按协议需要缩略图；当前只实现图片缩略图生成。
         thumb_enc_data = None
         thumb_aes_key_b64 = None
         if media_type == 1:
-            try:
-                with Image.open(file_path) as img:
-                    img.thumbnail((320, 320), Image.Resampling.LANCZOS)
-                    thumb_raw = img.convert("RGB").tobytes("jpeg", quality=85)
-                    thumb_raw_size = len(thumb_raw)
-                    thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
-                    thumb_aes_key_bytes, thumb_aes_key_b64 = self._generate_aes_key()
-                    thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
-                    payload.update({
-                        "thumb_rawsize": thumb_raw_size,
-                        "thumb_rawfilemd5": thumb_raw_md5,
-                        "thumb_filesize": len(thumb_enc_data),
-                    })
-            except:
-                payload["no_need_thumb"] = True
+            thumb_raw = self._build_image_thumbnail(file_path)
+            thumb_raw_size = len(thumb_raw)
+            thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
+            thumb_aes_key_bytes, thumb_aes_key_b64 = self._generate_aes_key()
+            thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
+            payload.update({
+                "thumb_rawsize": thumb_raw_size,
+                "thumb_rawfilemd5": thumb_raw_md5,
+                "thumb_filesize": len(thumb_enc_data),
+            })
+        elif media_type == 2:
+            raise NotImplementedError("视频上传需要缩略图参数，当前未实现视频缩略图生成")
 
         # 调用 getUploadUrl
         resp = await self._post("/ilink/bot/getuploadurl", payload)
@@ -293,73 +305,98 @@ class ILinkBot:
         }
 
         if media_type == 1:
-            media_item.update({"mid_size": enc_size, "hd_size": enc_size})
+            media_item.update({
+                "mid_size": enc_size,
+                "hd_size": enc_size,
+                "raw_size": raw_size,
+            })
+            if thumb_param:
+                media_item["thumb_media"] = {
+                    "encrypt_query_param": thumb_param,
+                    "aes_key": thumb_aes_key_b64,
+                }
+                media_item["thumb_size"] = len(thumb_enc_data)
         else:
-            media_item["file_name"] = file_name
+            media_item.update({
+                "file_name": file_name,
+                "file_size": raw_size,
+            })
 
         return media_item
 
     async def _cdn_upload(self, filekey: str, data: bytes, encrypted_query_param: str) -> str:
         """执行CDN上传"""
-        url = f"{self.CDN_BASE}/c2c/upload?encrypted_query_param={encrypted_query_param}&filekey={filekey}"
-        resp = await self.client.post(
-            url, 
+        resp = await self.client.put(
+            f"{self.CDN_BASE}/c2c/upload",
+            params={
+                "encrypted_query_param": encrypted_query_param,
+                "filekey": filekey,
+            },
             content=data,
             headers={"Content-Type": "application/octet-stream"}
         )
+        resp.raise_for_status()
         download_param = (resp.headers.get("x-encrypted-param") or 
                          resp.headers.get("encrypted-param") or 
                          resp.headers.get("x-download-param"))
         if not download_param:
-            raise Exception("CDN 未返回 download param")
+            try:
+                result = resp.json()
+                download_param = (result.get("encrypt_query_param") or
+                                  result.get("encrypted_query_param") or
+                                  result.get("download_param"))
+            except Exception:
+                pass
+        if not download_param:
+            raise Exception(f"CDN 未返回 download param: status={resp.status_code}, body={resp.text[:200]}")
         return download_param
+
+    def _build_message_payload(self, to_user_id: str, item_list: list, context_token: str = "") -> Dict:
+        """构造 sendMessage 请求体。"""
+        if not to_user_id:
+            raise ValueError("to_user_id 不能为空")
+        if not item_list:
+            raise ValueError("item_list 不能为空")
+
+        msg = {
+            "to_user_id": to_user_id,
+            "item_list": item_list,
+        }
+        if context_token:
+            msg["context_token"] = context_token
+
+        return {"msg": msg}
 
     # ====================== 发送图片 ======================
     async def send_image(self, to_user_id: str, image_path: str, caption: str = "", context_token: str = ""):
         """发送本地图片"""
-        image_item = await self.upload_media(image_path, media_type=1)
-        
-        client_id = f"pybot-img-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-        
-        item_list = [{"type": 2, "image_item": image_item}]
+        image_item = await self.upload_media(image_path, media_type=1, to_user_id=to_user_id)
+
+        item_list = []
         if caption:
             item_list.append({"type": 1, "text_item": {"text": caption}})
+        item_list.append({"type": 2, "image_item": image_item})
 
-        await self._post("/ilink/bot/sendmessage", {
-            "msg": {
-                "from_user_id": "",
-                "to_user_id": to_user_id,
-                "client_id": client_id,
-                "message_type": 2,
-                "message_state": 2,
-                "context_token": context_token,
-                "item_list": item_list
-            }
-        })
+        await self._post(
+            "/ilink/bot/sendmessage",
+            self._build_message_payload(to_user_id, item_list, context_token)
+        )
         print(f"📸 图片已发送 → {to_user_id}")
 
     # ====================== 发送文件 ======================
     async def send_file(self, to_user_id: str, file_path: str, caption: str = "", context_token: str = ""):
         """发送任意文件"""
-        file_item = await self.upload_media(file_path, media_type=3)
-        
-        client_id = f"pybot-file-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-        
-        item_list = [{"type": 4, "file_item": file_item}]
+        file_item = await self.upload_media(file_path, media_type=3, to_user_id=to_user_id)
+
+        item_list = []
         if caption:
             item_list.append({"type": 1, "text_item": {"text": caption}})
+        item_list.append({"type": 4, "file_item": file_item})
 
-        await self._post("/ilink/bot/sendmessage", {
-            "msg": {
-                "from_user_id": "",
-                "to_user_id": to_user_id,
-                "client_id": client_id,
-                "message_type": 2,
-                "message_state": 2,
-                "context_token": context_token,
-                "item_list": item_list
-            }
-        })
+        await self._post(
+            "/ilink/bot/sendmessage",
+            self._build_message_payload(to_user_id, item_list, context_token)
+        )
         print(f"📎 文件已发送 → {to_user_id} ({file_item.get('file_name')})")
 
     async def _post(self, endpoint: str, json_data: Dict):
@@ -383,7 +420,7 @@ class ILinkBot:
                 return result
             return {"ret": 0, "msgs": [], "get_updates_buf": self.cursor}
 
-        if result.get("ret") != 0:
+        if result.get("ret") != 0 and result.get("ret") is not None:
             errcode = result.get("errcode") or result.get("ret")
             if errcode in (-14, 14):
                 raise Exception("会话已过期，需要重新登录")
@@ -430,32 +467,32 @@ class ILinkBot:
                 text = item.get("text_item", {}).get("text", "")
             
             elif item_type == 2: # 图片
-                print(f"📸 收到图片消息")
+                print(f"收到图片消息")
                 image_path = await self.download_image(item.get("image_item", {}), msg_id)
 
         if text:
-            print(f"💬 收到文本: {text}")
+            print(f"收到文本: {text}")
             await self.send_text(from_id, f"已收到：{text}", context_token)
         
         if image_path:
-            # await self.send_text(from_id, "✅ 已收到图片！", context_token)
+            # await self.send_text(from_id, f"已收到图片:{image_path}", context_token)
             # 示例：echo 发送回去
             await self.send_image(from_id, image_path, "这是你发给我的图片", context_token)
 
     async def send_text(self, to_user_id: str, text: str, context_token: str):
         client_id = f"pybot-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-        
-        await self._post("/ilink/bot/sendmessage", {
+        payload = {
             "msg": {
+                "message_id": client_id,
                 "from_user_id": "",
-                "to_user_id": to_user_id,
-                "client_id": client_id,
+                "to_user_id": to_user_id,                
                 "message_type": 2,
                 "message_state": 2,
                 "context_token": context_token,
                 "item_list": [{"type": 1, "text_item": {"text": text}}]
             }
-        })
+        }
+        await self._post("/ilink/bot/sendmessage", payload)    
         print(f"已回复 → {to_user_id}")
 
     async def run(self):
