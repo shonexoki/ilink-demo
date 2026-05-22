@@ -435,11 +435,11 @@ class ILinkBot:
     # ====================== 发送文件 ======================
     async def send_file(self, to_user_id: str, file_path: str, caption: str = "", context_token: str = ""):
         """发送任意文件"""
-        # 1. 上传文件 (假设文件对应的 media_type 为 3 或 4，视你们的 API 文档而定，这里保持 3)
+        # 1. 上传文件 (假设文件对应的 media_type 为 3)
         uploaded = await self.upload_media(file_path, media_type=3, to_user_id=to_user_id)
 
-        # 2. 100% 还原 Node.js 奇葩的 Buffer.from(aeskey).toString("base64")
-        aes_key_hex = uploaded["media"]["aes_key"]  # 这是 Hex 格式的字符串
+        # 2. 还原 Node.js 奇葩的 Buffer.from(aeskey).toString("base64")
+        aes_key_hex = uploaded["media"]["aes_key"]
         aes_key_b64_node_style = base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8")
 
         # 3. 构造完美的文件 Item 结构
@@ -449,8 +449,10 @@ class ILinkBot:
                 "aes_key": aes_key_b64_node_style,
                 "encrypt_type": 1,
             },
-            "file_name": uploaded["file_name"],   # 文件名是必填的
-            "len": uploaded["len"]     # 文件通常传原始大小 (raw_size) 供客户端显示
+            "file_name": uploaded["file_name"],
+            
+            # 致命修复 1: 必须强转为字符串，严丝合缝对齐 TS 的 String(uploaded.fileSize)
+            "len": str(uploaded["len"]) 
         }
 
         # 4. 构造消息队列（文字和文件拆开发送）
@@ -458,13 +460,23 @@ class ILinkBot:
         if caption:
             items.append({"type": 1, "text_item": {"text": caption}}) # 文本 type 为 1
             
-        items.append({"type": 4, "file_item": file_item}) # 文件 type 通常为 4
+        items.append({"type": 4, "file_item": file_item}) # 文件 type 为 4
 
-        # 5. 严格对齐原 TS 逻辑：遍历 items 独立发送，确保 clientId 每次都不一样
+        # 5. 遍历 items 独立发送
         for item in items:
-            # 依赖上一回修复过的 _build_message_payload (里面会自动生成 uuid client_id)
+            # 获取基础的 payload {"msg": {"to_user_id": ..., "client_id": ..., "item_list": [...]}}
             payload = self._build_message_payload(to_user_id, [item], context_token)
-            payload.update({"message_type": 2, "message_state": 2})
+            
+            # 致命修复 2: 参数必须放进 payload["msg"] 里面，且补充 TS 里的 from_user_id
+            payload["msg"].update({
+                "from_user_id": "",      # 对齐 TS: from_user_id: ""
+                "message_type": 2,       # 对齐 TS: MessageType.BOT
+                "message_state": 2       # 对齐 TS: MessageState.FINISH
+            })
+            
+            # 最终打印看一眼结构对不对
+            # print(f"DEBUG Payload: {payload}")
+            
             await self._post("/ilink/bot/sendmessage", payload)
 
         print(f"📎 文件已发送 → {to_user_id} ({uploaded['file_name']})")
