@@ -411,10 +411,17 @@ class ILinkBot:
         if not item_list:
             raise ValueError("item_list 不能为空")
 
+        # 修复2: 补充 TS 原码中的 client_id 和其他字段
         msg = {
             "to_user_id": to_user_id,
+            "client_id": uuid.uuid4().hex,  # 服务端通常需要防重放 ID
             "item_list": item_list,
+            
+            # 视服务端的严格程度，可以取消注释以下两行（如果报错的话）：
+            # "message_type": "BOT",    # TS 中的 MessageType.BOT 
+            # "message_state": "FINISH" # TS 中的 MessageState.FINISH
         }
+        
         if context_token:
             msg["context_token"] = context_token
 
@@ -423,18 +430,39 @@ class ILinkBot:
     # ====================== 发送图片 ======================
     async def send_image(self, to_user_id: str, image_path: str, caption: str = "", context_token: str = ""):
         """发送本地图片"""
+        # 1. 上传媒体，获取返回结构
         image_item = await self.upload_media(image_path, media_type=1, to_user_id=to_user_id)
 
-        item_list = []
-        if caption:
-            item_list.append({"type": 1, "text_item": {"text": caption}})
-        item_list.append({"type": 2, "image_item": image_item})
+        # 2. 修复3: 补齐 encrypt_type 并将 aes_key 转为 Base64
+        if "media" in image_item:
+            image_item["media"]["encrypt_type"] = 1
+            
+            # 将原 Hex 格式的 aes_key 转换为服务端要求的 Base64
+            aes_key_hex = image_item["media"].get("aes_key", "")
+            if isinstance(aes_key_hex, str) and len(aes_key_hex) == 32:
+                # 标准用法：将 16 进制 bytes 编码为 Base64
+                aes_key_b64 = base64.b64encode(bytes.fromhex(aes_key_hex)).decode("utf-8")
+                
+                # 【重要备选说明】: 
+                # 如果上面那行发送后依然报 aes_key 解密失败，请换成下面这行：
+                # aes_key_b64 = base64.b64encode(aes_key_hex.encode('utf-8')).decode("utf-8")
+                # 因为原 TS 中 `Buffer.from` 如果没加 'hex' 参数，默认是将字符串本身做 Base64 编码。
+                
+                image_item["media"]["aes_key"] = aes_key_b64
 
-        await self._post(
-            "/ilink/bot/sendmessage",
-            self._build_message_payload(to_user_id, item_list, context_token)
-        )
-        print(f"📸 图片已发送 → {to_user_id}")
+        # 3. 构造 items 队列
+        items = []
+        if caption:
+            items.append({"type": 1, "text_item": {"text": caption}})  # MessageItemType.TEXT 通常为 1
+        
+        items.append({"type": 2, "image_item": image_item})            # MessageItemType.IMAGE 通常为 2
+
+        # 4. 修复1: 严格对齐 TS 中的 for 循环，每次只发送一个 item
+        for item in items:
+            payload = self._build_message_payload(to_user_id, [item], context_token)
+            await self._post("/ilink/bot/sendmessage", payload)
+            
+        print(f"📸 消息（文字/图片）已发送 → {to_user_id}")
 
     # ====================== 发送文件 ======================
     async def send_file(self, to_user_id: str, file_path: str, caption: str = "", context_token: str = ""):
@@ -536,7 +564,7 @@ class ILinkBot:
         client_id = f"pybot-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
         payload = {
             "msg": {
-                "message_id": client_id,
+                "client_id": client_id,
                 "from_user_id": "",
                 "to_user_id": to_user_id,                
                 "message_type": 2,
