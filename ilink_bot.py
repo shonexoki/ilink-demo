@@ -13,6 +13,11 @@ from PIL import Image
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
+import hashlib
+import urllib.parse  # 必须引入用于 URL 编码
+from io import BytesIO
+from typing import Dict
+from PIL import Image
 
 
 class ILinkBot:
@@ -233,13 +238,8 @@ class ILinkBot:
 
     # ====================== 新增：上传媒体 ======================
     async def upload_media(self, file_path: str, media_type: int = 1, to_user_id: str = "") -> Dict:
-        """加密并上传媒体，返回可放入 MessageItem 的媒体字段内容。"""
         if not os.path.exists(file_path):
             raise FileNotFoundError(file_path)
-        if media_type not in (1, 2, 3):
-            raise ValueError("media_type 仅支持 1=IMAGE, 2=VIDEO, 3=FILE")
-        if not to_user_id:
-            raise ValueError("上传媒体必须提供 to_user_id")
 
         with open(file_path, "rb") as f:
             raw_data = f.read()
@@ -247,9 +247,13 @@ class ILinkBot:
         file_name = os.path.basename(file_path)
         raw_size = len(raw_data)
         raw_md5 = hashlib.md5(raw_data).hexdigest()
-        filekey = f"pybot_{int(time.time())}_{uuid.uuid4().hex[:16]}"
+        
+        # 修复4: 严格对齐 TS 的 filekey 生成 (16字节 random bytes 转 hex -> 32位长度)
+        filekey = os.urandom(16).hex()
 
-        aes_key_bytes, aes_key_b64 = self._generate_aes_key()
+        # 修复3: AES Key 需要是 Hex 格式而不是 Base64
+        aes_key_bytes = os.urandom(16)
+        aes_key_hex = aes_key_bytes.hex() 
         enc_data = self._encrypt_aes_ecb(raw_data, aes_key_bytes)
         enc_size = len(enc_data)
 
@@ -260,96 +264,145 @@ class ILinkBot:
             "rawsize": raw_size,
             "rawfilemd5": raw_md5,
             "filesize": enc_size,
+            "aeskey": aes_key_hex,  # 使用 Hex 字符串
+            "no_need_thumb": False
         }
 
-        # 图片和视频按协议需要缩略图；当前只实现图片缩略图生成。
         thumb_enc_data = None
-        thumb_aes_key_b64 = None
-        if media_type == 1:
-            thumb_raw = self._build_image_thumbnail(file_path)
-            thumb_raw_size = len(thumb_raw)
-            thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
-            thumb_aes_key_bytes, thumb_aes_key_b64 = self._generate_aes_key()
-            thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
-            payload.update({
-                "thumb_rawsize": thumb_raw_size,
-                "thumb_rawfilemd5": thumb_raw_md5,
-                "thumb_filesize": len(thumb_enc_data),
-            })
-        elif media_type == 2:
-            raise NotImplementedError("视频上传需要缩略图参数，当前未实现视频缩略图生成")
+        thumb_upload_param = None
 
-        # 调用 getUploadUrl
+        # 图片缩略图处理
+        if media_type == 1:
+            try:
+                with Image.open(file_path) as img:
+                    if img.width > 300 or img.height > 300:
+                        img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                        thumb_buffer = BytesIO()
+                        img.convert("RGB").save(thumb_buffer, format="JPEG", quality=85, optimize=True)
+                        thumb_raw = thumb_buffer.getvalue()
+
+                        thumb_raw_size = len(thumb_raw)
+                        thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
+                        
+                        thumb_aes_key_bytes = os.urandom(16)
+                        thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
+
+                        payload.update({
+                            "thumb_rawsize": thumb_raw_size,
+                            "thumb_rawfilemd5": thumb_raw_md5,
+                            "thumb_filesize": len(thumb_enc_data),
+                        })
+                        print("✅ 缩略图生成成功")
+                    else:
+                        payload["no_need_thumb"] = True
+            except Exception as e:
+                print(f"⚠️ 缩略图生成失败: {e}")
+                payload["no_need_thumb"] = True
+
+        # 调用 getuploadurl
         resp = await self._post("/ilink/bot/getuploadurl", payload)
         
         upload_param = resp.get("upload_param")
         thumb_upload_param = resp.get("thumb_upload_param")
+        upload_full_url = resp.get("upload_full_url")
 
-        if not upload_param:
-            raise Exception(f"缺少 upload_param: {resp}")
+        print(f"getuploadurl 返回 → upload_param: {bool(upload_param)}, thumb_upload_param: {bool(thumb_upload_param)}")
+
+        if not upload_param and not upload_full_url:
+            raise Exception(f"getuploadurl 未返回 upload_param 或 upload_full_url: {resp}")
 
         # 上传主文件
-        main_param = await self._cdn_upload(filekey, enc_data, upload_param)
+        main_download_param = await self._cdn_upload(
+            filekey=filekey,
+            encrypted_data=enc_data,
+            upload_param=upload_param,
+            upload_full_url=upload_full_url,
+            label="主文件"
+        )
 
         # 上传缩略图（如果有）
-        thumb_param = None
         if thumb_enc_data and thumb_upload_param:
-            thumb_param = await self._cdn_upload(filekey, thumb_enc_data, thumb_upload_param)
+            await self._cdn_upload(
+                filekey=filekey,
+                encrypted_data=thumb_enc_data,
+                upload_param=thumb_upload_param,
+                upload_full_url=None,
+                label="缩略图"
+            )
 
-        # 构造 item
+        # 构造 media_item
         media_item = {
             "media": {
-                "encrypt_query_param": main_param,
-                "aes_key": aes_key_b64,
+                "encrypt_query_param": main_download_param,
+                "aes_key": aes_key_hex,  # 对齐下发也用 Hex
             }
         }
 
         if media_type == 1:
-            media_item.update({
-                "mid_size": enc_size,
-                "hd_size": enc_size,
-                "raw_size": raw_size,
-            })
-            if thumb_param:
-                media_item["thumb_media"] = {
-                    "encrypt_query_param": thumb_param,
-                    "aes_key": thumb_aes_key_b64,
-                }
-                media_item["thumb_size"] = len(thumb_enc_data)
+            media_item.update({"mid_size": enc_size, "hd_size": enc_size})
         else:
-            media_item.update({
-                "file_name": file_name,
-                "file_size": raw_size,
-            })
+            media_item["file_name"] = file_name
 
         return media_item
 
-    async def _cdn_upload(self, filekey: str, data: bytes, encrypted_query_param: str) -> str:
-        """执行CDN上传"""
-        resp = await self.client.put(
-            f"{self.CDN_BASE}/c2c/upload",
-            params={
-                "encrypted_query_param": encrypted_query_param,
-                "filekey": filekey,
-            },
-            content=data,
-            headers={"Content-Type": "application/octet-stream"}
-        )
-        resp.raise_for_status()
-        download_param = (resp.headers.get("x-encrypted-param") or 
-                         resp.headers.get("encrypted-param") or 
-                         resp.headers.get("x-download-param"))
-        if not download_param:
+    async def _cdn_upload(self, filekey: str, encrypted_data: bytes, 
+                        upload_param: str = None, 
+                        upload_full_url: str = None,
+                        label: str = "CDN_Upload") -> str:
+        """严格参考官方 buildCdnUploadUrl + uploadBufferToCdn"""
+        import asyncio
+        max_retries = 3
+
+        for attempt in range(1, max_retries + 1):
             try:
-                result = resp.json()
-                download_param = (result.get("encrypt_query_param") or
-                                  result.get("encrypted_query_param") or
-                                  result.get("download_param"))
-            except Exception:
-                pass
-        if not download_param:
-            raise Exception(f"CDN 未返回 download param: status={resp.status_code}, body={resp.text[:200]}")
-        return download_param
+                if upload_full_url and str(upload_full_url).strip():
+                    cdn_url = str(upload_full_url).strip()
+                elif upload_param:
+                    # 修复2: 必须对 upload_param 和 filekey 进行 URL 编码，防止特殊字符丢失
+                    safe_param = urllib.parse.quote(upload_param)
+                    safe_filekey = urllib.parse.quote(filekey)
+                    cdn_url = (
+                        f"{self.CDN_BASE}/c2c/upload"
+                        f"?encrypted_query_param={safe_param}"
+                        f"&filekey={safe_filekey}"
+                    )
+                else:
+                    raise Exception("缺少 upload_param 或 upload_full_url")
+
+                print(f"📤 {label} 第{attempt}次 | 大小: {len(encrypted_data)/1024:.1f}KB")
+
+                # 修复1: 必须使用 POST 请求而不是 PUT
+                resp = await self.client.post(
+                    cdn_url,
+                    content=encrypted_data,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "User-Agent": "ilink-bot-client"
+                    }
+                )
+
+                if resp.status_code >= 400:
+                    error_msg = resp.headers.get("x-error-message") or resp.text
+                    raise Exception(f"CDN 返回 {resp.status_code}: {error_msg}")
+
+                download_param = (
+                    resp.headers.get("x-encrypted-param") or
+                    resp.headers.get("encrypted-param") or
+                    resp.headers.get("x-download-param")
+                )
+
+                if not download_param:
+                    raise Exception("CDN 未返回 x-encrypted-param")
+
+                print(f"✅ {label} 上传成功")
+                return download_param
+
+            except Exception as e:
+                print(f"⚠️ {label} 第{attempt}次失败: {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(1.5)
+                else:
+                    raise
 
     def _build_message_payload(self, to_user_id: str, item_list: list, context_token: str = "") -> Dict:
         """构造 sendMessage 请求体。"""
