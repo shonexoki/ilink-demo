@@ -165,14 +165,14 @@ class ILinkBot:
         unpadder = padding.PKCS7(128).unpadder()
         return unpadder.update(padded_data) + unpadder.finalize()
 
-    async def download_image(self, image_item: Dict, msg_id: str = "") -> Optional[str]:
-        """下载并解密图片，返回本地保存路径"""
+    async def download_file(self, image_item: Dict, msg_id: str = "") -> Optional[str]:
+        """下载并解密文件，返回本地保存路径"""
         try:
-            aeskey_str = image_item.get("aeskey") or image_item.get("media", {}).get("aes_key")
+            aeskey_str = image_item.get("media", {}).get("aes_key")
             media = image_item.get("media") or {}
             
             if not aeskey_str:
-                print("⚠️ 图片缺少 aeskey")
+                print("⚠️ 文件缺少 aeskey")
                 return None
             
             aes_key = self._decode_aes_key(aeskey_str)
@@ -180,7 +180,7 @@ class ILinkBot:
             encrypted_param = media.get("encrypt_query_param")
             
             if not download_url:
-                print("⚠️ 图片缺少下载链接")
+                print("⚠️ 文件缺少下载链接")
                 return None
 
             # 下载加密数据
@@ -195,17 +195,22 @@ class ILinkBot:
             plain_data = self._decrypt_aes_ecb(resp.content, aes_key)
             
             # 保存文件
-            filename = f"img_{int(time.time())}_{msg_id[-8:]}.jpg"
+            original_filename = image_item.get("file_name")
+            suffix = ".jpg"
+            if original_filename:
+                print(f"原始文件名: {original_filename}")
+                suffix = os.path.splitext(original_filename)[1] if original_filename else ""
+            filename = f"file_{int(time.time())}_{msg_id[-8:]}{suffix}"
             filepath = os.path.join(self.DOWNLOAD_DIR, filename)
             
             with open(filepath, "wb") as f:
                 f.write(plain_data)
             
-            print(f"✅ 图片已保存: {filepath} ({len(plain_data)/1024:.1f} KB)")
+            print(f"✅ 文件已保存: {filepath} ({len(plain_data)/1024:.1f} KB)")
             return filepath
             
         except Exception as e:
-            print(f"❌ 下载/解密图片失败: {e}")
+            print(f"❌ 下载/解密文件失败: {e}")
             return None
 
     # ====================== 新增：AES 加密 ======================
@@ -268,37 +273,6 @@ class ILinkBot:
             "no_need_thumb": True  # 默认不生成缩略图，后续根据需要再上传
         }
 
-        # thumb_enc_data = None
-        # thumb_upload_param = None
-
-        # 图片缩略图处理
-        # if media_type == 1:
-        #     try:
-        #         with Image.open(file_path) as img:
-        #             if img.width > 300 or img.height > 300:
-        #                 img.thumbnail((320, 320), Image.Resampling.LANCZOS)
-        #                 thumb_buffer = BytesIO()
-        #                 img.convert("RGB").save(thumb_buffer, format="JPEG", quality=85, optimize=True)
-        #                 thumb_raw = thumb_buffer.getvalue()
-
-        #                 thumb_raw_size = len(thumb_raw)
-        #                 thumb_raw_md5 = hashlib.md5(thumb_raw).hexdigest()
-                        
-        #                 thumb_aes_key_bytes = os.urandom(16)
-        #                 thumb_enc_data = self._encrypt_aes_ecb(thumb_raw, thumb_aes_key_bytes)
-
-        #                 payload.update({
-        #                     "thumb_rawsize": thumb_raw_size,
-        #                     "thumb_rawfilemd5": thumb_raw_md5,
-        #                     "thumb_filesize": len(thumb_enc_data),
-        #                 })
-        #                 print("✅ 缩略图生成成功")
-        #             else:
-        #                 payload["no_need_thumb"] = True
-        #     except Exception as e:
-        #         print(f"⚠️ 缩略图生成失败: {e}")
-        #         payload["no_need_thumb"] = True
-
         # 调用 getuploadurl
         resp = await self._post("/ilink/bot/getuploadurl", payload)
         
@@ -320,16 +294,6 @@ class ILinkBot:
             label="主文件"
         )
 
-        # 上传缩略图（如果有）
-        # if thumb_enc_data and thumb_upload_param:
-        #     await self._cdn_upload(
-        #         filekey=filekey,
-        #         encrypted_data=thumb_enc_data,
-        #         upload_param=thumb_upload_param,
-        #         upload_full_url=None,
-        #         label="缩略图"
-        #     )
-
         # 构造 media_item
         media_item = {
             "media": {
@@ -342,6 +306,7 @@ class ILinkBot:
             media_item.update({"mid_size": enc_size, "hd_size": enc_size})
         else:
             media_item["file_name"] = file_name
+            media_item["len"] = raw_size
 
         return media_item
 
@@ -470,18 +435,39 @@ class ILinkBot:
     # ====================== 发送文件 ======================
     async def send_file(self, to_user_id: str, file_path: str, caption: str = "", context_token: str = ""):
         """发送任意文件"""
-        file_item = await self.upload_media(file_path, media_type=3, to_user_id=to_user_id)
+        # 1. 上传文件 (假设文件对应的 media_type 为 3 或 4，视你们的 API 文档而定，这里保持 3)
+        uploaded = await self.upload_media(file_path, media_type=3, to_user_id=to_user_id)
 
-        item_list = []
+        # 2. 100% 还原 Node.js 奇葩的 Buffer.from(aeskey).toString("base64")
+        aes_key_hex = uploaded["media"]["aes_key"]  # 这是 Hex 格式的字符串
+        aes_key_b64_node_style = base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8")
+
+        # 3. 构造完美的文件 Item 结构
+        file_item = {
+            "media": {
+                "encrypt_query_param": uploaded["media"]["encrypt_query_param"],
+                "aes_key": aes_key_b64_node_style,
+                "encrypt_type": 1,
+            },
+            "file_name": uploaded["file_name"],   # 文件名是必填的
+            "len": uploaded["len"]     # 文件通常传原始大小 (raw_size) 供客户端显示
+        }
+
+        # 4. 构造消息队列（文字和文件拆开发送）
+        items = []
         if caption:
-            item_list.append({"type": 1, "text_item": {"text": caption}})
-        item_list.append({"type": 4, "file_item": file_item})
+            items.append({"type": 1, "text_item": {"text": caption}}) # 文本 type 为 1
+            
+        items.append({"type": 4, "file_item": file_item}) # 文件 type 通常为 4
 
-        await self._post(
-            "/ilink/bot/sendmessage",
-            self._build_message_payload(to_user_id, item_list, context_token)
-        )
-        print(f"📎 文件已发送 → {to_user_id} ({file_item.get('file_name')})")
+        # 5. 严格对齐原 TS 逻辑：遍历 items 独立发送，确保 clientId 每次都不一样
+        for item in items:
+            # 依赖上一回修复过的 _build_message_payload (里面会自动生成 uuid client_id)
+            payload = self._build_message_payload(to_user_id, [item], context_token)
+            payload.update({"message_type": 2, "message_state": 2})
+            await self._post("/ilink/bot/sendmessage", payload)
+
+        print(f"📎 文件已发送 → {to_user_id} ({uploaded['file_name']})")
 
     async def _post(self, endpoint: str, json_data: Dict):
         payload = {**json_data, "base_info": {"channel_version": "1.0.0"}}
@@ -553,7 +539,7 @@ class ILinkBot:
             
             elif item_type == 2: # 图片
                 print(f"收到图片消息")
-                image_path = await self.download_image(item.get("image_item", {}), msg_id)
+                image_path = await self.download_file(item.get("image_item", {}), msg_id)
 
             elif item_type == 4: # 文件 
                 file_path = await self.download_file(item.get("file_item", {}), msg_id)
