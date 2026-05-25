@@ -6,18 +6,14 @@ import base64
 import hashlib
 import os
 from io import BytesIO
+from urllib.parse import quote
 import httpx
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import qrcode
 from PIL import Image
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
-import hashlib
-import urllib.parse  # 必须引入用于 URL 编码
-from io import BytesIO
-from typing import Dict
-from PIL import Image
 
 
 class ILinkBot:
@@ -25,6 +21,18 @@ class ILinkBot:
     CDN_BASE = "https://novac2c.cdn.weixin.qq.com"
     SESSION_FILE = "ilink_bot_session.json"
     DOWNLOAD_DIR = "downloads"
+
+    MEDIA_TYPE_IMAGE = 1
+    MEDIA_TYPE_VIDEO = 2
+    MEDIA_TYPE_FILE = 3
+
+    ITEM_TYPE_TEXT = 1
+    ITEM_TYPE_IMAGE = 2
+    ITEM_TYPE_FILE = 4
+
+    MESSAGE_TYPE_BOT = 2
+    MESSAGE_STATE_FINISH = 2
+    ENCRYPT_TYPE_AES_ECB = 1
     
     def __init__(self):
         self.token: Optional[str] = None
@@ -225,10 +233,15 @@ class ILinkBot:
         return encryptor.update(padded_data) + encryptor.finalize()
 
     def _generate_aes_key(self) -> Tuple[bytes, str]:
-        """生成随机AES Key，返回 (bytes, base64格式)"""
+        """生成随机 AES Key，返回原始字节和 hex 字符串。"""
         key_bytes = os.urandom(16)
-        key_b64 = base64.b64encode(key_bytes).decode()
-        return key_bytes, key_b64
+        return key_bytes, key_bytes.hex()
+
+    def _encode_aes_key_for_message(self, aes_key_hex: str) -> str:
+        """按当前后端兼容格式编码消息体中的 AES Key。"""
+        if not aes_key_hex:
+            raise ValueError("AES Key 不能为空")
+        return base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8")
 
     def _build_image_thumbnail(self, file_path: str) -> bytes:
         """生成 JPEG 缩略图字节。"""
@@ -241,10 +254,15 @@ class ILinkBot:
             img.save(buffer, format="JPEG", quality=85, optimize=True)
             return buffer.getvalue()
 
-    # ====================== 新增：上传媒体 ======================
+    # ====================== 上传媒体 ======================
     async def upload_media(self, file_path: str, media_type: int = 1, to_user_id: str = "") -> Dict:
+        """加密并上传媒体，返回发送消息所需的媒体描述。"""
         if not os.path.exists(file_path):
             raise FileNotFoundError(file_path)
+        if media_type not in (self.MEDIA_TYPE_IMAGE, self.MEDIA_TYPE_VIDEO, self.MEDIA_TYPE_FILE):
+            raise ValueError(f"不支持的 media_type: {media_type}")
+        if not to_user_id:
+            raise ValueError("to_user_id 不能为空")
 
         with open(file_path, "rb") as f:
             raw_data = f.read()
@@ -253,12 +271,9 @@ class ILinkBot:
         raw_size = len(raw_data)
         raw_md5 = hashlib.md5(raw_data).hexdigest()
         
-        # 修复4: 严格对齐 TS 的 filekey 生成 (16字节 random bytes 转 hex -> 32位长度)
         filekey = os.urandom(16).hex()
 
-        # 修复3: AES Key 需要是 Hex 格式而不是 Base64
-        aes_key_bytes = os.urandom(16)
-        aes_key_hex = aes_key_bytes.hex() 
+        aes_key_bytes, aes_key_hex = self._generate_aes_key()
         enc_data = self._encrypt_aes_ecb(raw_data, aes_key_bytes)
         enc_size = len(enc_data)
 
@@ -269,18 +284,14 @@ class ILinkBot:
             "rawsize": raw_size,
             "rawfilemd5": raw_md5,
             "filesize": enc_size,
-            "aeskey": aes_key_hex,  # 使用 Hex 字符串
-            "no_need_thumb": True  # 默认不生成缩略图，后续根据需要再上传
+            "aeskey": aes_key_hex,
+            "no_need_thumb": True,
         }
 
-        # 调用 getuploadurl
         resp = await self._post("/ilink/bot/getuploadurl", payload)
         
         upload_param = resp.get("upload_param")
-        # thumb_upload_param = resp.get("thumb_upload_param")
         upload_full_url = resp.get("upload_full_url")
-
-        # print(f"getuploadurl 返回 → upload_param: {bool(upload_param)}, thumb_upload_param: {bool(thumb_upload_param)}")
 
         if not upload_param and not upload_full_url:
             raise Exception(f"getuploadurl 未返回 upload_param 或 upload_full_url: {resp}")
@@ -298,11 +309,11 @@ class ILinkBot:
         media_item = {
             "media": {
                 "encrypt_query_param": main_download_param,
-                "aes_key": aes_key_hex,  # 对齐下发也用 Hex
+                "aes_key": aes_key_hex,
             }
         }
 
-        if media_type == 1:
+        if media_type == self.MEDIA_TYPE_IMAGE:
             media_item.update({"mid_size": enc_size, "hd_size": enc_size})
         else:
             media_item["file_name"] = file_name
@@ -314,8 +325,7 @@ class ILinkBot:
                         upload_param: str = None, 
                         upload_full_url: str = None,
                         label: str = "CDN_Upload") -> str:
-        """严格参考官方 buildCdnUploadUrl + uploadBufferToCdn"""
-        import asyncio
+        """上传加密后的媒体内容到 CDN，返回后续下载所需的加密参数。"""
         max_retries = 3
 
         for attempt in range(1, max_retries + 1):
@@ -323,9 +333,8 @@ class ILinkBot:
                 if upload_full_url and str(upload_full_url).strip():
                     cdn_url = str(upload_full_url).strip()
                 elif upload_param:
-                    # 修复2: 必须对 upload_param 和 filekey 进行 URL 编码，防止特殊字符丢失
-                    safe_param = urllib.parse.quote(upload_param)
-                    safe_filekey = urllib.parse.quote(filekey)
+                    safe_param = quote(upload_param)
+                    safe_filekey = quote(filekey)
                     cdn_url = (
                         f"{self.CDN_BASE}/c2c/upload"
                         f"?encrypted_query_param={safe_param}"
@@ -336,7 +345,6 @@ class ILinkBot:
 
                 print(f"📤 {label} 第{attempt}次 | 大小: {len(encrypted_data)/1024:.1f}KB")
 
-                # 修复1: 必须使用 POST 请求而不是 PUT
                 resp = await self.client.post(
                     cdn_url,
                     content=encrypted_data,
@@ -376,15 +384,13 @@ class ILinkBot:
         if not item_list:
             raise ValueError("item_list 不能为空")
 
-        # 修复2: 补充 TS 原码中的 client_id 和其他字段
         msg = {
+            "from_user_id": "",
             "to_user_id": to_user_id,
-            "client_id": uuid.uuid4().hex,  # 服务端通常需要防重放 ID
+            "client_id": uuid.uuid4().hex,
+            "message_type": self.MESSAGE_TYPE_BOT,
+            "message_state": self.MESSAGE_STATE_FINISH,
             "item_list": item_list,
-            
-            # 视服务端的严格程度，可以取消注释以下两行（如果报错的话）：
-            # "message_type": "BOT",    # TS 中的 MessageType.BOT 
-            # "message_state": "FINISH" # TS 中的 MessageState.FINISH
         }
         
         if context_token:
@@ -392,92 +398,57 @@ class ILinkBot:
 
         return {"msg": msg}
 
+    async def _send_items(self, to_user_id: str, item_list: List[Dict], context_token: str = ""):
+        """按当前后端兼容方式逐条发送 MessageItem。"""
+        for item in item_list:
+            payload = self._build_message_payload(to_user_id, [item], context_token)
+            await self._post("/ilink/bot/sendmessage", payload)
+
+    def _text_item(self, text: str) -> Dict:
+        return {"type": self.ITEM_TYPE_TEXT, "text_item": {"text": text}}
+
+    def _prepare_media_for_send(self, media_item: Dict):
+        media = media_item.get("media")
+        if not media:
+            raise ValueError("media_item 缺少 media 字段")
+
+        aes_key_hex = media.get("aes_key", "")
+        media["aes_key"] = self._encode_aes_key_for_message(aes_key_hex)
+        media["encrypt_type"] = self.ENCRYPT_TYPE_AES_ECB
+
     # ====================== 发送图片 ======================
     async def send_image(self, to_user_id: str, image_path: str, caption: str = "", context_token: str = ""):
         """发送本地图片"""
-        # 1. 上传媒体，获取返回结构
-        image_item = await self.upload_media(image_path, media_type=1, to_user_id=to_user_id)
+        image_item = await self.upload_media(image_path, media_type=self.MEDIA_TYPE_IMAGE, to_user_id=to_user_id)
+        self._prepare_media_for_send(image_item)
 
-        # 2. 修复3: 补齐 encrypt_type 并将 aes_key 转为 Base64
-        if "media" in image_item:
-            image_item["media"]["encrypt_type"] = 1
-            
-            # 将原 Hex 格式的 aes_key 转换为服务端要求的 Base64
-            aes_key_hex = image_item["media"].get("aes_key", "")
-            aes_key_b64_node_style = base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8")
-            # if isinstance(aes_key_hex, str) and len(aes_key_hex) == 32:
-                # 标准用法：将 16 进制 bytes 编码为 Base64
-                # aes_key_b64 = base64.b64encode(bytes.fromhex(aes_key_hex)).decode("utf-8")
-                
-                # 【重要备选说明】: 
-                # 如果上面那行发送后依然报 aes_key 解密失败，请换成下面这行：
-                # aes_key_b64 = base64.b64encode(aes_key_hex.encode('utf-8')).decode("utf-8")
-                # 因为原 TS 中 `Buffer.from` 如果没加 'hex' 参数，默认是将字符串本身做 Base64 编码。
-                
-                # image_item["media"]["aes_key"] = aes_key_b64
-        image_item["media"]["aes_key"] = aes_key_b64_node_style
-        # 3. 构造 items 队列
         items = []
         if caption:
-            items.append({"type": 1, "text_item": {"text": caption}})  # MessageItemType.TEXT 通常为 1
+            items.append(self._text_item(caption))
         
-        items.append({"type": 2, "image_item": image_item})            # MessageItemType.IMAGE 通常为 2
-
-        # 4. 修复1: 严格对齐 TS 中的 for 循环，每次只发送一个 item
-        for item in items:
-            payload = self._build_message_payload(to_user_id, [item], context_token)
-            payload.update({"message_type": 2})  
-            payload.update({"message_state": 2})
-            await self._post("/ilink/bot/sendmessage", payload)
+        items.append({"type": self.ITEM_TYPE_IMAGE, "image_item": image_item})
+        await self._send_items(to_user_id, items, context_token)
             
         print(f"📸 消息（文字/图片）已发送 → {to_user_id}")
 
     # ====================== 发送文件 ======================
     async def send_file(self, to_user_id: str, file_path: str, caption: str = "", context_token: str = ""):
         """发送任意文件"""
-        # 1. 上传文件 (假设文件对应的 media_type 为 3)
-        uploaded = await self.upload_media(file_path, media_type=3, to_user_id=to_user_id)
+        uploaded = await self.upload_media(file_path, media_type=self.MEDIA_TYPE_FILE, to_user_id=to_user_id)
+        self._prepare_media_for_send(uploaded)
 
-        # 2. 还原 Node.js 奇葩的 Buffer.from(aeskey).toString("base64")
-        aes_key_hex = uploaded["media"]["aes_key"]
-        aes_key_b64_node_style = base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8")
-
-        # 3. 构造完美的文件 Item 结构
         file_item = {
-            "media": {
-                "encrypt_query_param": uploaded["media"]["encrypt_query_param"],
-                "aes_key": aes_key_b64_node_style,
-                "encrypt_type": 1,
-            },
+            "media": uploaded["media"],
             "file_name": uploaded["file_name"],
-            
-            # 致命修复 1: 必须强转为字符串，严丝合缝对齐 TS 的 String(uploaded.fileSize)
-            "len": str(uploaded["len"]) 
+            "len": str(uploaded["len"]),
         }
 
-        # 4. 构造消息队列（文字和文件拆开发送）
         items = []
         if caption:
-            items.append({"type": 1, "text_item": {"text": caption}}) # 文本 type 为 1
+            items.append(self._text_item(caption))
             
-        items.append({"type": 4, "file_item": file_item}) # 文件 type 为 4
-
-        # 5. 遍历 items 独立发送
-        for item in items:
-            # 获取基础的 payload {"msg": {"to_user_id": ..., "client_id": ..., "item_list": [...]}}
-            payload = self._build_message_payload(to_user_id, [item], context_token)
-            
-            # 致命修复 2: 参数必须放进 payload["msg"] 里面，且补充 TS 里的 from_user_id
-            payload["msg"].update({
-                "from_user_id": "",      # 对齐 TS: from_user_id: ""
-                "message_type": 2,       # 对齐 TS: MessageType.BOT
-                "message_state": 2       # 对齐 TS: MessageState.FINISH
-            })
-            
-            # 最终打印看一眼结构对不对
-            # print(f"DEBUG Payload: {payload}")
-            
-            await self._post("/ilink/bot/sendmessage", payload)
+        items.append({"type": self.ITEM_TYPE_FILE, "file_item": file_item})
+        await self._send_items(to_user_id, items, context_token)
 
         print(f"📎 文件已发送 → {to_user_id} ({uploaded['file_name']})")
 
@@ -571,19 +542,7 @@ class ILinkBot:
             await self.send_file(from_id, file_path, "这是你发给我的文件", context_token)
 
     async def send_text(self, to_user_id: str, text: str, context_token: str):
-        client_id = f"pybot-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-        payload = {
-            "msg": {
-                "client_id": client_id,
-                "from_user_id": "",
-                "to_user_id": to_user_id,                
-                "message_type": 2,
-                "message_state": 2,
-                "context_token": context_token,
-                "item_list": [{"type": 1, "text_item": {"text": text}}]
-            }
-        }
-        await self._post("/ilink/bot/sendmessage", payload)    
+        await self._send_items(to_user_id, [self._text_item(text)], context_token)
         print(f"已回复 → {to_user_id}")
 
     async def run(self):
